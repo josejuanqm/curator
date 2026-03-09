@@ -65,6 +65,66 @@ def connect(db_path: str = "curator.db") -> sqlite3.Connection:
     return conn
 
 
+def _check_vec_dim(conn: sqlite3.Connection, table: str) -> Optional[int]:
+    """
+    Check if a vec0 table exists and has the correct embedding dimension.
+    Returns:
+      EMBEDDING_DIM if table exists with correct dim
+      -1 if table exists with wrong dim
+      None if table doesn't exist
+    """
+    # First check if table exists at all
+    exists = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+        (table,)
+    ).fetchone()
+    if not exists:
+        return None
+
+    try:
+        # Probe MATCH with expected dimension
+        probe = json.dumps([0.0] * EMBEDDING_DIM)
+        conn.execute(
+            f"SELECT distance FROM {table} WHERE embedding MATCH ? AND k = 1",
+            (probe,)
+        ).fetchall()
+        return EMBEDDING_DIM  # dim matches
+    except Exception as e:
+        if "dimension mismatch" in str(e).lower():
+            return -1  # exists but wrong dim
+        # Other errors (empty table, etc.) — assume OK if table exists
+        return EMBEDDING_DIM
+
+
+def _rebuild_vec_tables(conn: sqlite3.Connection):
+    """Drop and recreate vec0 tables when embedding dimension has changed."""
+    print(f"[curator] Rebuilding vector tables for {EMBEDDING_DIM}-dim embeddings...")
+
+    # Drop old vec0 tables
+    for table in ("conception_embeddings", "episode_embeddings"):
+        try:
+            conn.execute(f"DROP TABLE IF EXISTS {table}")
+        except Exception:
+            pass
+
+    # Recreate with correct dimension
+    conn.execute(f"""
+        CREATE VIRTUAL TABLE conception_embeddings
+        USING vec0(
+            conception_id INTEGER PRIMARY KEY,
+            embedding FLOAT[{EMBEDDING_DIM}]
+        )
+    """)
+    conn.execute(f"""
+        CREATE VIRTUAL TABLE episode_embeddings
+        USING vec0(
+            episode_id INTEGER PRIMARY KEY,
+            embedding FLOAT[{EMBEDDING_DIM}]
+        )
+    """)
+    conn.commit()
+
+
 def _init_schema(conn: sqlite3.Connection):
     conn.executescript("""
         -- Core conception table
@@ -76,14 +136,6 @@ def _init_schema(conn: sqlite3.Connection):
             last_updated    REAL NOT NULL,   -- unix timestamp
             source          TEXT,
             created_at      REAL NOT NULL
-        );
-
-        -- Vector index for semantic matching
-        -- Determines when new observations relate to existing conceptions
-        CREATE VIRTUAL TABLE IF NOT EXISTS conception_embeddings
-        USING vec0(
-            conception_id INTEGER PRIMARY KEY,
-            embedding FLOAT[384]
         );
 
         -- Observation log — raw inputs before they become conceptions
@@ -108,15 +160,39 @@ def _init_schema(conn: sqlite3.Connection):
     conn.execute("CREATE INDEX IF NOT EXISTS idx_episodes_session ON episodes(session_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_episodes_created ON episodes(created_at)")
 
-    # Episode embeddings — separate virtual table for vector recall
-    conn.execute("""
-        CREATE VIRTUAL TABLE IF NOT EXISTS episode_embeddings
-        USING vec0(
-            episode_id INTEGER PRIMARY KEY,
-            embedding FLOAT[384]
-        )
-    """)
-    conn.commit()
+    # Check if vec0 tables need rebuilding (dimension mismatch from model change)
+    conception_dim = _check_vec_dim(conn, "conception_embeddings")
+    episode_dim = _check_vec_dim(conn, "episode_embeddings")
+
+    needs_rebuild = (conception_dim == -1 or episode_dim == -1)
+    needs_create = (conception_dim is None or episode_dim is None)
+
+    if needs_rebuild:
+        _rebuild_vec_tables(conn)
+    elif needs_create:
+        # First time — create vec0 tables
+        try:
+            conn.execute(f"""
+                CREATE VIRTUAL TABLE IF NOT EXISTS conception_embeddings
+                USING vec0(
+                    conception_id INTEGER PRIMARY KEY,
+                    embedding FLOAT[{EMBEDDING_DIM}]
+                )
+            """)
+        except Exception:
+            pass
+        try:
+            conn.execute(f"""
+                CREATE VIRTUAL TABLE IF NOT EXISTS episode_embeddings
+                USING vec0(
+                    episode_id INTEGER PRIMARY KEY,
+                    embedding FLOAT[{EMBEDDING_DIM}]
+                )
+            """)
+        except Exception:
+            pass
+        conn.commit()
+    # else: tables exist with correct dimension, nothing to do
 
 
 # --- Weight mechanics ---
