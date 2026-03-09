@@ -162,6 +162,8 @@ This creates a high-recency conception that will surface next session.""",
                 "required": ["summary"]
             }
         ),
+        types.Tool(
+            name="inspect",
             description="Show full conception space with all weights. Use for debugging or when user asks what you remember.",
             inputSchema={
                 "type": "object",
