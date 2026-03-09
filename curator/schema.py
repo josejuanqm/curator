@@ -25,6 +25,8 @@ INITIAL_RECENCY = 1.0
 INITIAL_CONFIDENCE = 0.1        # starts low, grows through signal
 EXPLICIT_INSTRUCTION_MAGNITUDE = 1.0  # user correction = max contradiction
 SEMANTIC_MATCH_THRESHOLD = 0.82 # cosine similarity to consider same conception
+PASSIVE_REINFORCE_THRESHOLD = 0.88 # higher bar for implicit reinforcement from episodes
+PASSIVE_REINFORCE_DELTA = 0.02    # small bump — acting on a preference counts, not just stating it
 SURFACE_RECENCY_THRESHOLD = 0.15
 SURFACE_CONFIDENCE_THRESHOLD = 0.05
 EMBEDDING_DIM = 384             # all-MiniLM-L6-v2 dimension
@@ -389,7 +391,12 @@ def log_episode(
     assistant_summary: str,
     embedding: list[float]
 ) -> int:
-    """Insert episode and its embedding. Returns episode id."""
+    """
+    Insert episode and its embedding.
+    Also passively reinforces semantically related conceptions — acting on
+    a preference counts as weak confirmation, even without explicit restatement.
+    Returns episode id.
+    """
     cur = conn.execute(
         "INSERT INTO episodes (session_id, user_input, assistant_summary) VALUES (?, ?, ?)",
         (session_id, user_input, assistant_summary)
@@ -400,6 +407,18 @@ def log_episode(
         (episode_id, json.dumps(embedding))
     )
     conn.commit()
+
+    # Passive reinforcement — find conceptions closely related to this episode
+    # and give them a small confidence bump. Higher threshold than normal matching
+    # to avoid noise from loosely related conceptions.
+    related = find_related_conceptions(
+        conn, embedding,
+        threshold=PASSIVE_REINFORCE_THRESHOLD,
+        limit=3
+    )
+    for conception_id, similarity in related:
+        update_weight(conn, conception_id, PASSIVE_REINFORCE_DELTA)
+
     return episode_id
 
 
