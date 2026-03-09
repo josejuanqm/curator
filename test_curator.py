@@ -229,17 +229,20 @@ def test_6_surface(conn):
     # Add a fresh low-confidence conception
     observe(conn, "I've been thinking about trying Rust lately", source="test")
 
-    surfaced = surface(conn, SignalQuality(score=0.9, reason="test"))
+    LIMIT = 10
+    surfaced = surface(conn, SignalQuality(score=0.9, reason="test"), limit=LIMIT)
 
     if surfaced:
         result("surfaced conceptions", len(surfaced))
         for c in surfaced[:3]:
             result(f"  #{c.id}", f"rec={c.recency:.3f} conf={c.confidence:.3f} | {c.content[:60]}")
 
-        # First surfaced should be highest recency
-        assert_true(surfaced[0].recency >= surfaced[-1].recency,
-            "Surface ordered by recency first")
-        assert_true(len(surfaced) <= 8, "Surface respects limit")
+        # Recency ordering — in fast test execution all recencies are ~equal
+        # so we verify the list is sorted non-ascending (equal values pass)
+        recencies = [c.recency for c in surfaced]
+        assert_true(recencies == sorted(recencies, reverse=True),
+            "Surface ordered by recency descending")
+        assert_true(len(surfaced) <= LIMIT, f"Surface respects limit ({LIMIT})")
     else:
         info("No conceptions above surface threshold yet")
         assert_true(True, "Surface ran without error")
