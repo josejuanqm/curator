@@ -94,7 +94,19 @@ def _init_schema(conn: sqlite3.Connection):
             observed_at     REAL NOT NULL,
             resulted_in     TEXT          -- JSON list of affected conception ids
         );
+
+        -- Episode log — full conversation record, separate from conception space
+        -- Append-only. No weights. Never surfaces as conceptions.
+        CREATE TABLE IF NOT EXISTS episodes (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id       TEXT NOT NULL,
+            user_input       TEXT NOT NULL,
+            assistant_summary TEXT,
+            created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
     """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_episodes_session ON episodes(session_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_episodes_created ON episodes(created_at)")
     conn.commit()
 
 

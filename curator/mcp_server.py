@@ -139,6 +139,55 @@ Use returned context naturally — do not announce the memory system.""",
             }
         ),
         types.Tool(
+            name="log_episode",
+            description="""Log a conversation exchange to the episode store.
+Call this after EVERY user message — both the user input and a summary of your response.
+This is separate from the conception space and never affects weights.
+Used for episodic recall: "what did we work on last Tuesday?"
+
+Call this unconditionally — every exchange, every session. It's a log, not a filter.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "description": "Stable identifier for this session (use current timestamp or project name)"
+                    },
+                    "user_input": {
+                        "type": "string",
+                        "description": "The user's exact message"
+                    },
+                    "assistant_summary": {
+                        "type": "string",
+                        "description": "1-3 sentence summary of what you did or said in response"
+                    }
+                },
+                "required": ["session_id", "user_input", "assistant_summary"]
+            }
+        ),
+        types.Tool(
+            name="recall",
+            description="""Search episode history for past conversations.
+Use when the user asks about past work: "what did we do last week?", "did we solve X?", "what was the approach we used?"
+Searches both user inputs and assistant summaries.
+Returns chronological episodes matching the query.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "What to search for in past episodes"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max episodes to return",
+                        "default": 10
+                    }
+                },
+                "required": ["query"]
+            }
+        ),
+        types.Tool(
             name="log_session",
             description="""Store a summary of the current session before it ends.
 Call this when the user says goodbye, closes out, or when you sense the session is wrapping up.
@@ -176,7 +225,61 @@ This creates a high-recency conception that will surface next session.""",
 @server.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
 
-    if name == "create_conception":
+    # ── Episode store (conversation log, separate from conception space) ──────
+
+    if name == "log_episode":
+        session_id = arguments.get("session_id", "unknown")
+        user_input = arguments.get("user_input", "").strip()
+        assistant_summary = arguments.get("assistant_summary", "").strip()
+
+        if not user_input:
+            return [types.TextContent(type="text", text="Error: user_input required")]
+
+        conn.execute(
+            "INSERT INTO episodes (session_id, user_input, assistant_summary) VALUES (?, ?, ?)",
+            (session_id, user_input, assistant_summary)
+        )
+        conn.commit()
+        return [types.TextContent(type="text", text="Episode logged.")]
+
+    elif name == "recall":
+        query = arguments.get("query", "").strip()
+        limit = arguments.get("limit", 10)
+
+        if not query:
+            return [types.TextContent(type="text", text="Error: query required")]
+
+        words = query.lower().split()
+        conditions = " AND ".join(
+            "(LOWER(user_input) LIKE ? OR LOWER(assistant_summary) LIKE ?)"
+            for _ in words
+        )
+        params = []
+        for w in words:
+            params.extend([f"%{w}%", f"%{w}%"])
+        params.append(limit)
+
+        rows = conn.execute(
+            f"SELECT session_id, user_input, assistant_summary, created_at "
+            f"FROM episodes WHERE {conditions} ORDER BY created_at DESC LIMIT ?",
+            params
+        ).fetchall()
+
+        if not rows:
+            return [types.TextContent(type="text", text=f"No episodes found for: '{query}'")]
+
+        lines = [f"Episodes matching '{query}':\n"]
+        for row in rows:
+            lines.append(
+                f"[{row[3][:16]}] session:{row[0][:20]}\n"
+                f"  User: {row[1][:100]}\n"
+                f"  {row[2][:120] if row[2] else '(no summary)'}"
+            )
+        return [types.TextContent(type="text", text="\n\n".join(lines))]
+
+    # ── Conception space ──────────────────────────────────────────────────────
+
+    elif name == "create_conception":
         content = arguments.get("content", "").strip()
         initial_confidence = arguments.get("initial_confidence", INITIAL_CONFIDENCE)
 
@@ -271,10 +374,8 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         content = f"[Session {timestamp}] {summary}"
 
         embedding = embed(content)
-        # High recency start, low confidence — episodic not persistent
         cid = create_conception(conn, content, embedding, "session_log",
                                 initial_confidence=0.15)
-        # Bump recency to max so it surfaces next session
         conn.execute("UPDATE conceptions SET recency = 1.0 WHERE id = ?", (cid,))
         conn.commit()
 
