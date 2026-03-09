@@ -335,25 +335,47 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
     elif name == "surface":
         signal_quality = arguments.get("signal_quality", 0.9)
         limit = arguments.get("limit", 8)
+        episode_limit = arguments.get("episode_limit", 5)
 
         sq = SignalQuality(score=signal_quality, reason="requested")
         conceptions = surface_fn(conn, sq, limit=limit)
 
-        if not conceptions:
+        lines = []
+
+        # Recent episodes first — what just happened
+        recent_episodes = conn.execute(
+            "SELECT session_id, user_input, assistant_summary, created_at "
+            "FROM episodes ORDER BY created_at DESC LIMIT ?",
+            (episode_limit,)
+        ).fetchall()
+
+        if recent_episodes:
+            lines.append("Recent episodes:\n")
+            for row in recent_episodes:
+                lines.append(
+                    f"[{row[3][:16]}] {row[0][:20]}\n"
+                    f"  User: {row[1][:80]}\n"
+                    f"  {row[2][:100] if row[2] else '(no summary)'}"
+                )
+            lines.append("")
+
+        # Conceptions — persistent context
+        if conceptions:
+            lines.append("Active conceptions:\n")
+            for i, c in enumerate(conceptions, 1):
+                lines.append(
+                    f"{i}. [{c.id}] {c.content}\n"
+                    f"   recency: {c.recency:.2f} | confidence: {c.confidence:.2f}"
+                )
             total = conn.execute("SELECT COUNT(*) FROM conceptions").fetchone()[0]
-            return [types.TextContent(type="text", text=
-                f"No conceptions above threshold. Total in space: {total}"
-            )]
+            lines.append(f"\n{len(conceptions)} surfaced of {total} total")
+        else:
+            total = conn.execute("SELECT COUNT(*) FROM conceptions").fetchone()[0]
+            lines.append(f"No conceptions above threshold. Total in space: {total}")
 
-        lines = ["Active context:\n"]
-        for i, c in enumerate(conceptions, 1):
-            lines.append(
-                f"{i}. [{c.id}] {c.content}\n"
-                f"   recency: {c.recency:.2f} | confidence: {c.confidence:.2f}"
-            )
+        if not lines:
+            return [types.TextContent(type="text", text="Nothing in context yet.")]
 
-        total = conn.execute("SELECT COUNT(*) FROM conceptions").fetchone()[0]
-        lines.append(f"\n{len(conceptions)} surfaced of {total} total")
         return [types.TextContent(type="text", text="\n".join(lines))]
 
     elif name == "log_session":
