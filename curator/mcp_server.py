@@ -118,23 +118,56 @@ Returns conceptions above similarity threshold with their current weights.""",
         ),
         types.Tool(
             name="surface",
-            description="""Return currently relevant conceptions ordered by recency then confidence.
-Call at the start of each session and before complex responses.
-Recency governs the present (high recency = recently active).
-Confidence governs persistence (high confidence = repeatedly confirmed).
-Use returned context naturally — do not announce the memory system.""",
+            description="""Return relevant conceptions and recent episodes for the current moment.
+Call at the start of every session, passing as much context as you have.
+The richer the context, the more relevant what surfaces.
+
+Context is used to rerank results by semantic relevance before returning —
+cwd and opening_message are the strongest signals.""",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "signal_quality": {
                         "type": "number",
-                        "description": "0.0-1.0. Use 0.9 for clear context, lower for ambiguous requests. Below 0.3 returns nothing.",
+                        "description": "0.0-1.0. Use 0.9 for clear context, lower for ambiguous. Below 0.3 returns nothing.",
                         "default": 0.9
                     },
                     "limit": {
                         "type": "integer",
                         "description": "Max conceptions to return",
                         "default": 8
+                    },
+                    "episode_limit": {
+                        "type": "integer",
+                        "description": "Max recent episodes to return",
+                        "default": 5
+                    },
+                    "context": {
+                        "type": "object",
+                        "description": "Current session context for relevance reranking. Pass everything you know.",
+                        "properties": {
+                            "cwd": {
+                                "type": "string",
+                                "description": "Current working directory e.g. /Users/jose/source/krill"
+                            },
+                            "git_branch": {
+                                "type": "string",
+                                "description": "Current git branch e.g. feature/tvos-support"
+                            },
+                            "datetime": {
+                                "type": "string",
+                                "description": "ISO datetime e.g. 2026-03-09T22:14:00"
+                            },
+                            "opening_message": {
+                                "type": "string",
+                                "description": "The user's first message this session — strongest semantic signal"
+                            },
+                            "recent_files": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Recently touched files"
+                            }
+                        }
                     }
                 }
             }
@@ -336,32 +369,102 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         signal_quality = arguments.get("signal_quality", 0.9)
         limit = arguments.get("limit", 8)
         episode_limit = arguments.get("episode_limit", 5)
+        context = arguments.get("context", {})
 
         sq = SignalQuality(score=signal_quality, reason="requested")
-        conceptions = surface_fn(conn, sq, limit=limit)
+
+        # Build a context string for semantic reranking
+        context_parts = []
+        cwd = context.get("cwd", "")
+        git_branch = context.get("git_branch", "")
+        opening_message = context.get("opening_message", "")
+        recent_files = context.get("recent_files", [])
+        datetime_str = context.get("datetime", "")
+
+        if cwd:
+            # Extract project name from path — most signal-dense part
+            project = cwd.rstrip("/").split("/")[-1]
+            context_parts.append(f"project: {project} ({cwd})")
+        if git_branch:
+            context_parts.append(f"branch: {git_branch}")
+        if opening_message:
+            context_parts.append(f"user said: {opening_message}")
+        if recent_files:
+            context_parts.append(f"recent files: {', '.join(recent_files[:5])}")
+        if datetime_str:
+            context_parts.append(f"time: {datetime_str}")
+
+        context_str = " | ".join(context_parts)
+        has_context = bool(context_str)
+
+        # Get base conceptions from weight engine
+        conceptions = surface_fn(conn, sq, limit=limit * 2 if has_context else limit)
+
+        # Rerank by semantic similarity to context if we have it
+        if has_context and conceptions:
+            context_embedding = embed(context_str)
+            scored = []
+            for c in conceptions:
+                # Get stored embedding for this conception
+                row = conn.execute(
+                    "SELECT embedding FROM conception_embeddings WHERE conception_id = ?",
+                    (c.id,)
+                ).fetchone()
+                if row:
+                    import json as _json
+                    stored = _json.loads(row[0])
+                    # Cosine similarity
+                    dot = sum(a * b for a, b in zip(context_embedding, stored))
+                    context_score = max(0.0, dot)
+                else:
+                    context_score = 0.0
+
+                # Blend: weight score (recency + confidence) + context relevance
+                weight_score = (c.recency * 0.5) + (c.confidence * 0.5)
+                combined = (weight_score * 0.5) + (context_score * 0.5)
+                scored.append((combined, c))
+
+            scored.sort(key=lambda x: x[0], reverse=True)
+            conceptions = [c for _, c in scored[:limit]]
 
         lines = []
 
-        # Recent episodes first — what just happened
-        recent_episodes = conn.execute(
-            "SELECT session_id, user_input, assistant_summary, created_at "
-            "FROM episodes ORDER BY created_at DESC LIMIT ?",
-            (episode_limit,)
-        ).fetchall()
+        # Recent episodes — reranked by context if available
+        if has_context and opening_message:
+            # Use opening message to find semantically relevant episodes
+            episode_embedding = embed(opening_message + " " + context_str)
+            from schema import find_related_episodes
+            relevant_episodes = find_related_episodes(conn, episode_embedding, limit=episode_limit)
+            if relevant_episodes:
+                lines.append("Relevant episodes:\n")
+                for ep in relevant_episodes:
+                    lines.append(
+                        f"[{ep['created_at'][:16]}] {ep['session_id'][:20]}\n"
+                        f"  User: {ep['user_input'][:80]}\n"
+                        f"  {ep['assistant_summary'][:100] if ep['assistant_summary'] else '(no summary)'}"
+                    )
+                lines.append("")
+        else:
+            # Fall back to recency
+            recent_episodes = conn.execute(
+                "SELECT session_id, user_input, assistant_summary, created_at "
+                "FROM episodes ORDER BY created_at DESC LIMIT ?",
+                (episode_limit,)
+            ).fetchall()
+            if recent_episodes:
+                lines.append("Recent episodes:\n")
+                for row in recent_episodes:
+                    lines.append(
+                        f"[{row[3][:16]}] {row[0][:20]}\n"
+                        f"  User: {row[1][:80]}\n"
+                        f"  {row[2][:100] if row[2] else '(no summary)'}"
+                    )
+                lines.append("")
 
-        if recent_episodes:
-            lines.append("Recent episodes:\n")
-            for row in recent_episodes:
-                lines.append(
-                    f"[{row[3][:16]}] {row[0][:20]}\n"
-                    f"  User: {row[1][:80]}\n"
-                    f"  {row[2][:100] if row[2] else '(no summary)'}"
-                )
-            lines.append("")
-
-        # Conceptions — persistent context
+        # Conceptions
         if conceptions:
-            lines.append("Active conceptions:\n")
+            label = "Relevant conceptions:" if has_context else "Active conceptions:"
+            lines.append(f"{label}\n")
             for i, c in enumerate(conceptions, 1):
                 lines.append(
                     f"{i}. [{c.id}] {c.content}\n"
@@ -372,6 +475,9 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         else:
             total = conn.execute("SELECT COUNT(*) FROM conceptions").fetchone()[0]
             lines.append(f"No conceptions above threshold. Total in space: {total}")
+
+        if has_context:
+            lines.append(f"\n[context: {context_str[:120]}]")
 
         if not lines:
             return [types.TextContent(type="text", text="Nothing in context yet.")]
